@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>网页批注教学板</title>
+<style>
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;-webkit-user-select:none;user-select:none}
+  html,body{margin:0;height:100%;overflow:hidden;background:#000;
+    font:14px/1.4 -apple-system,system-ui,"PingFang SC",sans-serif}
+  #app{display:flex;flex-direction:column;height:100%}
+
+  /* ---------- 工具栏 ---------- */
+  #bar{display:flex;align-items:center;gap:6px;flex:0 0 auto;overflow-x:auto;
+       -webkit-overflow-scrolling:touch;
+       padding:8px;padding-top:calc(8px + env(safe-area-inset-top));
+       background:#1c1c1e;border-bottom:1px solid #2c2c2e}
+  #bar>*{flex:0 0 auto}
+  #url{width:min(38vw,320px);min-width:150px;padding:9px 12px;border-radius:9px;
+       border:1px solid #3a3a3c;background:#2c2c2e;color:#fff;font-size:15px;
+       -webkit-user-select:text;user-select:text}
+  #url::placeholder{color:#8e8e93}
+  button{padding:9px 13px;border-radius:9px;border:1px solid #3a3a3c;
+         background:#2c2c2e;color:#eee;font-size:15px;line-height:1;white-space:nowrap}
+  button:active{background:#3a3a3c}
+  button.on{background:#0a84ff;border-color:#0a84ff;color:#fff}
+  .sw{width:28px;height:28px;padding:0;border-radius:50%;border:3px solid transparent}
+  .sw.on{border-color:#fff;box-shadow:0 0 0 1px #000 inset}
+  #size{width:90px;accent-color:#0a84ff}
+
+  /* ---------- 舞台 ---------- */
+  #stage{position:relative;flex:1 1 auto;overflow:hidden;background:#fff}
+  #frame{position:absolute;inset:0;width:100%;height:100%;border:0;background:#fff}
+  #ink{position:absolute;inset:0;width:100%;height:100%;
+       touch-action:none;z-index:2;cursor:crosshair}
+  /* 浏览模式：画布不接收任何事件，全部穿透给网页 */
+  body.browse #ink{pointer-events:none;cursor:default}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="bar">
+    <input id="url" type="text" inputmode="url" autocapitalize="off" autocorrect="off"
+           placeholder="输入网址后点「前往」">
+    <button id="go">前往</button>
+    <button id="mode" class="on">✏️ 批注中</button>
+    <button class="tool on" data-tool="pen">笔</button>
+    <button class="tool" data-tool="highlighter">荧光笔</button>
+    <button class="tool" data-tool="eraser">橡皮</button>
+    <span id="colors" style="display:flex;gap:6px;align-items:center"></span>
+    <input id="size" type="range" min="1" max="20" step="1" value="3">
+    <button id="undo">↶ 撤销</button>
+    <button id="clear">清空</button>
+  </div>
+
+  <div id="stage">
+    <iframe id="frame" src="about:blank"
+            allow="fullscreen; clipboard-read; clipboard-write; autoplay"
+            referrerpolicy="no-referrer-when-downgrade"></iframe>
+    <canvas id="ink"></canvas>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  const $ = s => document.querySelector(s);
+  const frame  = $('#frame');
+  const canvas = $('#ink');
+  const ctx    = canvas.getContext('2d');
+
+  // ---------------- 状态 ----------------
+  const PALETTE = ['#ff3b30','#ff9500','#ffcc00','#34c759','#0a84ff','#af52de','#000000','#ffffff'];
+
+  let strokes   = [];      // 已完成笔画
+  let current   = null;    // 正在画的笔画
+  let tool      = 'pen';   // pen | highlighter | eraser
+  let color     = '#ff3b30';
+  let lineWidth = 3;
+  let annotating = true;   // 是否处于批注模式
+
+  // ---------------- 画布尺寸 ----------------
+  function fitCanvas () {
+    const r   = canvas.getBoundingClientRect();
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    const w   = Math.max(1, Math.round(r.width  * dpr));
+    const h   = Math.max(1, Math.round(r.height * dpr));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width  = w;
+      canvas.height = h;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    redraw();
+  }
+
+  if (window.ResizeObserver) new ResizeObserver(fitCanvas).observe(canvas);
+  window.addEventListener('resize', fitCanvas);
+  window.addEventListener('orientationchange', () => setTimeout(fitCanvas, 350));
+
+  // ---------------- 绘制 ----------------
+  function drawStroke (s) {
+    const pts = s.points;
+    if (!pts || !pts.length) return;
+
+    ctx.save();
+    ctx.lineCap  = 'round';
+    ctx.lineJoin = 'round';
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+
+    let baseW = s.width;
+
+    if (s.tool === 'eraser') {
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.strokeStyle = '#000';
+      ctx.fillStyle   = '#000';
+      baseW = s.width * 4;
+    } else if (s.tool === 'highlighter') {
+      ctx.globalAlpha = 0.32;
+      ctx.strokeStyle = s.color;
+      ctx.fillStyle   = s.color;
+      baseW = s.width * 3.5;
+    } else {
+      ctx.strokeStyle = s.color;
+      ctx.fillStyle   = s.color;
+    }
+
+    if (pts.length === 1) {
+      const p = pts[0];
+      const r = Math.max(baseW * (0.35 + (p.p || 0.5)), 0.7);
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      return;
+    }
+
+    if (s.tool === 'pen') {
+      // 压感：逐段变宽
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1], b = pts[i];
+        ctx.lineWidth = baseW * (0.4 + 1.2 * (b.p == null ? 0.5 : b.p));
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      }
+    } else {
+      // 荧光笔 / 橡皮：整条路径一次成型，避免叠加变深
+      ctx.lineWidth = baseW;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function redraw () {
+    const r = canvas.getBoundingClientRect();
+    ctx.clearRect(0, 0, r.width, r.height);
+    for (let i = 0; i < strokes.length; i++) drawStroke(strokes[i]);
+    if (current) drawStroke(current);
+  }
+
+  let rafId = 0;
+  function schedule () {
+    if (rafId) return;
+    rafId = requestAnimationFrame(() => { rafId = 0; redraw(); });
+  }
+
+  // ---------------- 指针输入 ----------------
+  let drawing = false;
+  let activeId = null;
+
+  function toLocal (e) {
+    const r = canvas.getBoundingClientRect();
+    return {
+      x: e.clientX - r.left,
+      y: e.clientY - r.top,
+      // Apple Pencil 有真实压力；手指/鼠标给固定值
+      p: e.pointerType === 'pen' ? (e.pressure > 0 ? e.pressure : 0.5) : 0.5
+    };
+  }
+
+  canvas.addEventListener('pointerdown', e => {
+    if (!annotating) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    e.preventDefault();
+
+    drawing  = true;
+    activeId = e.pointerId;
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+
+    current = {
+      tool:   tool,
+      color:  color,
+      width:  lineWidth,
+      points: [toLocal(e)]
+    };
+    schedule();
+  }, { passive: false });
+
+  canvas.addEventListener('pointermove', e => {
+    if (!drawing || e.pointerId !== activeId || !current) return;
+    e.preventDefault();
+
+    // 用合并事件拿到 Apple Pencil 的高采样率轨迹
+    let list;
+    try { list = e.getCoalescedEvents ? e.getCoalescedEvents() : null; } catch (_) { list = null; }
+    if (!list || !list.length) list = [e];
+
+    const pts = current.points;
+    for (let i = 0; i < list.length; i++) {
+      const p = toLocal(list[i]);
+      const last = pts[pts.length - 1];
+      if (Math.abs(p.x - last.x) + Math.abs(p.y - last.y) < 0.7) continue;
+      pts.push(p);
+    }
+    schedule();
+  }, { passive: false });
+
+  function endStroke (e) {
+    if (!drawing) return;
+    if (e && e.pointerId !== activeId) return;
+    drawing  = false;
+    activeId = null;
+    if (current && current.points.length) strokes.push(current);
+    current = null;
+    redraw();
+  }
+  canvas.addEventListener('pointerup', endStroke);
+  canvas.addEventListener('pointercancel', endStroke);
+  canvas.addEventListener('pointerleave', endStroke);
+
+  // 防止 iPad 上的双指缩放 / 双击放大干扰批注
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(t =>
+    canvas.addEventListener(t, e => e.preventDefault(), { passive: false }));
+  canvas.addEventListener('dblclick', e => e.preventDefault());
+
+  // ---------------- 模式切换 ----------------
+  function setAnnotating (v) {
+    annotating = v;
+    document.body.classList.toggle('browse', !v);
+    const btn = $('#mode');
+    btn.textContent = v ? '✏️ 批注中' : '🖐 浏览中';
+    btn.classList.toggle('on', v);
+    if (v) fitCanvas();
+  }
+
+  // ---------------- 工具栏 ----------------
+  function setTool (t) {
+    tool = t;
+    document.querySelectorAll('.tool').forEach(b =>
+      b.classList.toggle('on', b.dataset.tool === t));
+  }
+
+  document.querySelectorAll('.tool').forEach(b => {
+    b.addEventListener('click', () => setTool(b.dataset.tool));
+  });
+
+  const colorsEl = $('#colors');
+  PALETTE.forEach(c => {
+    const b = document.createElement('button');
+    b.className = 'sw' + (c === color ? ' on' : '');
+    b.dataset.color = c;
+    b.style.background = c;
+    b.addEventListener('click', () => {
+      color = c;
+      if (tool === 'eraser') setTool('pen');
+      document.querySelectorAll('.sw').forEach(x =>
+        x.classList.toggle('on', x.dataset.color === c));
+    });
+    colorsEl.appendChild(b);
+  });
+
+  $('#size').addEventListener('input', e => {
+    lineWidth = parseInt(e.target.value, 10) || 3;
+  });
+
+  $('#undo').addEventListener('click', () => {
+    strokes.pop();
+    redraw();
+  });
+
+  $('#clear').addEventListener('click', () => {
+    if (!strokes.length && !current) return;
+    strokes = [];
+    current = null;
+    redraw();
+  });
+
+  $('#mode').addEventListener('click', () => setAnnotating(!annotating));
+
+  // ---------------- 加载网页 ----------------
+  function normalize (u) {
+    u = (u || '').trim();
+    if (!u) return null;
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) u = 'https://' + u;
+    return u;
+  }
+
+  function load () {
+    const u = normalize($('#url').value);
+    if (!u) { $('#url').focus(); return; }
+    frame.src = u;
+    setAnnotating(false);   // 载入后先让用户能操作网页
+  }
+
+  $('#go').addEventListener('click', load);
+  $('#url').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); load(); }
+  });
+
+  // ---------------- 键盘快捷键（接了妙控键盘时好用） ----------------
+  window.addEventListener('keydown', e => {
+    if (e.target.tagName === 'INPUT') return;
+    if (e.code === 'Space') { e.preventDefault(); setAnnotating(!annotating); }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+      e.preventDefault(); strokes.pop(); redraw();
+    }
+  });
+
+  // ---------------- 启动 ----------------
+  fitCanvas();
+  requestAnimationFrame(fitCanvas);
+  setAnnotating(true);
+})();
+</script>
+</body>
+</html>
